@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Metrics are served by Django on the internal network only (nginx does not proxy /metrics/).
+# Put the value of METRICS_TOKEN into deploy/monitoring/metrics_token (file, chmod 600, not committed).
+scrape_configs:
+  - job_name: 'django'
+    metrics_path: '/metrics/'
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics_token
+    static_configs:
+      - targets: ['backend:8000']
+
+  # Enable when you add the matching exporters to the stack:
+  # - job_name: 'postgres'   # postgres_exporter  -> postgres-exporter:9187
+  # - job_name: 'redis'      # redis_exporter     -> redis-exporter:9121

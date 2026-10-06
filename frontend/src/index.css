@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-family: 'Vazirmatn', 'IRANSans', 'Tahoma', sans-serif;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-family);
+  direction: rtl;
+  text-align: right;
+  background-color: #f5f5f5;
+}
+
+#root {
+  min-height: 100vh;
+}

@@ -1,0 +1,180 @@
+name: technical-inspection-production
+
+services:
+  clamav:
+    # Optional (~1 GB RAM): docker compose --profile scan up   +   MALWARE_SCAN_ENABLED=true
+    image: clamav/clamav:1.4.3
+    profiles: ["scan"]
+    restart: unless-stopped
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1:1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-inspection_platform}
+      POSTGRES_USER: ${POSTGRES_USER:-inspection}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the root .env file}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers $${WEB_CONCURRENCY:-3} --timeout 120 --access-logfile - --error-logfile -"
+    environment: &backend-env
+      DJANGO_SETTINGS_MODULE: config.settings_production
+      SECRET_KEY: ${SECRET_KEY:?Set a random SECRET_KEY of at least 50 characters}
+      DEBUG: "False"
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:?Set ALLOWED_HOSTS to your public hostname(s)}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-inspection}:${DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-inspection_platform}
+      REDIS_URL: redis://redis:6379/0
+      MALWARE_SCAN_ENABLED: ${MALWARE_SCAN_ENABLED:-false}
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: 3310
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:?Set CSRF_TRUSTED_ORIGINS, including https://your-domain}
+      SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT:-true}
+      DB_SSL_REQUIRE: ${DB_SSL_REQUIRE:-false}
+      NUM_PROXIES: ${NUM_PROXIES:-2}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      INTERNAL_2FA_REQUIRED: ${INTERNAL_2FA_REQUIRED:-false}
+      USE_X_ACCEL_REDIRECT: "true"
+      ADMIN_URL: ${ADMIN_URL:-admin/}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      SERVER_EMAIL: ${SERVER_EMAIL:-${DEFAULT_FROM_EMAIL}}
+      EMAIL_BACKEND: ${EMAIL_BACKEND:-django.core.mail.backends.smtp.EmailBackend}
+      EMAIL_HOST: ${EMAIL_HOST:?Set EMAIL_HOST}
+      EMAIL_PORT: ${EMAIL_PORT:-587}
+      EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
+      EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
+      EMAIL_USE_TLS: ${EMAIL_USE_TLS:-true}
+      DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL:?Set DEFAULT_FROM_EMAIL}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; req=urllib.request.Request(\"http://127.0.0.1:8000/api/health/ready/\", headers={\"X-Forwarded-Proto\": \"https\"}); urllib.request.urlopen(req, timeout=3)' "]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    command: celery -A config worker --loglevel=INFO --concurrency=${CELERY_CONCURRENCY:-2}
+    environment: *backend-env
+    depends_on:
+      backend: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [internal]
+
+  backup:
+    # One-shot: docker compose -f docker-compose.production.yml --profile ops run --rm backup
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    profiles: ["ops"]
+    command: python /app/scripts/backup_restore.py backup
+    environment:
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB:-inspection_platform}
+      PGUSER: ${POSTGRES_USER:-inspection}
+      PGPASSWORD: ${DB_PASSWORD}
+      BACKUP_DIR: /backups
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ${BACKUP_HOST_DIR:-./backups}:/backups
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [internal]
+
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    command: celery -A config beat --loglevel=INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment: *backend-env
+    depends_on:
+      backend: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [internal]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+      args:
+        VITE_API_URL: /api
+    restart: unless-stopped
+    networks: [internal]
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-127.0.0.1:8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - static_volume:/static:ro
+      - media_volume:/media:ro
+    depends_on:
+      backend: {condition: service_healthy}
+      frontend: {condition: service_healthy}
+    networks: [internal]
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+
+networks:
+  internal:
+    driver: bridge

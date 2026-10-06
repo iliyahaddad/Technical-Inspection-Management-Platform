@@ -1,0 +1,3 @@
+# Persian locale stub
+# Run: django-admin makemessages -l fa
+# Then edit locale/fa/LC_MESSAGES/django.po
