@@ -57,7 +57,7 @@ The application source is a work in progress, not yet certified for production u
 
 ## License
 
-Proprietary — commercial use only.
+ See [LICENSE](LICENSE).
 
 ## Production hardening added in finalization
 
